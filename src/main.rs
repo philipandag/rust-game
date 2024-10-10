@@ -14,34 +14,65 @@ use std::rc::Rc;
 use std::cell::{Ref, RefCell};
 use std::cell::RefMut;
 use std::collections::HashMap;
-
-#[derive(Debug, Clone)]
-struct FPoint3{
-    x: f32,
-    y: f32,
-    z: f32
-}
+use nalgebra::{Isometry3, Matrix4, Perspective3, Vector2, Vector3, Vector4, Point3, Point2};
+use std::fmt;
 
 type EntityBehavior = fn(entity_id: usize, entites: &Entities, entities_diff: &mut EntitiesMut);
 type Entities = HashMap<usize, Rc<dyn Entity>>;
 type EntitiesMut = HashMap<usize, Box<dyn Entity>>;
 
+type FVector4 = Vector4<f64>;
+type FVector3 = Vector3<f64>;
+type FVector2 = Vector2<f64>;
+type FPoint3 = Point3<f64>;
+type FPoint2 = Point2<f64>;
+
 struct DrawContext {
-    screen_center: FPoint3,
-    camera_pos: FPoint3,
-    fov: f32,
+    screen_center: FPoint2,
+    eye: FPoint3,
+    target: FPoint3,
+    view: Isometry3<f64>,
+    projection: Perspective3<f64>,
+    canvas: Canvas<Window>
+}
+
+impl fmt::Debug for DrawContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DrawContext")
+            .field("screen_center", &self.screen_center)
+            .field("eye", &self.eye)
+            .field("target", &self.target)
+            .field("view", &self.view)
+            .field("projection", &self.projection)
+            .finish()
+    }
+}
+
+impl DrawContext {
+    fn new(screen_center: FPoint2, camera_pos: FPoint3, fov: f64, canvas: Canvas<Window>) -> DrawContext {
+        let target = camera_pos + Vector3::new(0.0_f64, 0.0_f64, 1.0_f64);
+
+        DrawContext {
+            screen_center,
+            eye: camera_pos,
+            target: target,
+            view: Isometry3::look_at_rh(&camera_pos, &target, &Vector3::y()),
+            projection: Perspective3::new(screen_center.x / screen_center.y, fov.to_radians(), 0.1, 10000.0),
+            canvas
+        }
+    }
 }
 
 trait Entity {
     fn pos(&mut self) -> &mut FPoint3;
     fn get_pos(&self) -> &FPoint3;
-    fn vel(&mut self) -> &mut FPoint3;
-    fn get_vel(&self) -> &FPoint3;
-    fn acc(&mut self) -> &mut FPoint3;
-    fn get_acc(&self) -> &FPoint3;
+    fn vel(&mut self) -> &mut FVector3;
+    fn get_vel(&self) -> &FVector3;
+    fn acc(&mut self) -> &mut FVector3;
+    fn get_acc(&self) -> &FVector3;
     fn col(&mut self) -> &mut Color;
     fn get_col(&self) -> &Color;
-    fn draw(&self, c: &mut Canvas<Window>, ctx: &DrawContext);
+    fn draw(&self, ctx: &mut DrawContext);
     fn register_behavior(self: &mut Self, b: EntityBehavior);
     fn remove_behavior(self: &mut Self, b: EntityBehavior);
     fn behaviors(&self) -> &Vec<EntityBehavior>;
@@ -50,28 +81,26 @@ trait Entity {
 
 struct Planet {
     pos: FPoint3,
-    vel: FPoint3,
-    acc: FPoint3,
+    vel: FVector3,
+    acc: FVector3,
     color: Color,
     behaviors: Vec<EntityBehavior>,
-    rad: f32,
+    rad: f64,
 }
 
-fn circle_height(x: &f32, a: &f32, b: &f32, h: &f32)  -> f32{
+fn circle_height(x: f64, a: f64, b: f64, h: f64) -> f64{
     ((a*a) + a*x*2.0 + h*h - (x*x)).sqrt() + b
 }
 
-fn random(min: f32, max: f32) -> f32{
-    min + rand::random::<f32>() * (max-min)
+fn random(min: f64, max: f64) -> f64{
+    min + rand::random::<f64>() * (max-min)
 }
 
-fn random_point_around(around: &FPoint3, range: f32) -> FPoint3{
-    FPoint3 {
-        x: around.x + random(-range, range),
-        y: around.y + random(-range, range),
-        z: around.z + random(-range, range),
-    }
+fn random_point_around(around: &FPoint3, range: f64) -> FPoint3{
+    let offset = Vector3::new(random(-range, range), random(-range, range), random(-range, range));
+    around + offset
 }
+
 
 fn random_color() -> Color {
     Color::RGB(
@@ -81,21 +110,63 @@ fn random_color() -> Color {
     )
 }
 
-fn draw_circle(center: &FPoint, radius: &f32, color: &Color, canvas: &mut Canvas<Window>) {
+fn draw_circle(center: &FPoint3, radius: f64, color: &Color, ctx: &mut DrawContext) {
     let mut color = Color::RGB(color.r, color.g, color.b);
-    for i in -*radius as i32..*radius as i32 +5{
+    let center = project_point(center, ctx);
+    for i in -radius as i32..radius as i32 +5{
         color = Color::RGB(
             ((color.r as f32) *0.995) as u8, 
             ((color.g as f32) *0.995) as u8, 
             ((color.b as f32) *0.995) as u8, 
         );
-        canvas.set_draw_color(color);
-        let y = circle_height(&(i as f32), &1.0, &1.0, &radius);
-        canvas.draw_fline(
-            center.offset(i as f32, -y), 
-            center.offset(i as f32, y)
+        ctx.canvas.set_draw_color(color);
+        let y = circle_height(i as f64, 1.0, 1.0, radius);
+        ctx.canvas.draw_fline(
+            center.offset(i as f32, -y as f32), 
+            center.offset(i as f32, y as f32)
         );
     }
+}
+
+fn cube_corners(center: &FPoint3, size: f64) -> Vec<FPoint3> {
+    let size = size * 1.5;
+    let mut corners = Vec::new();
+    for x in [-1.0, 1.0].iter() {
+        for y in [-1.0, 1.0].iter() {
+            for z in [-1.0, 1.0].iter() {
+                corners.push(center + FVector3::new(size * x, size * y, size * z));
+            }
+        }
+    }
+    corners
+}
+
+fn draw_cube(corners: Vec<FPoint3>, color: &Color, ctx: &mut DrawContext) {
+    let mut color = Color::RGB(color.r, color.g, color.b);
+    let corners = corners.iter().map(|c| project_point(c, ctx)).collect::<Vec<FPoint>>();
+    print!("corners: {:?}", corners);
+    for i in 0..corners.len() {
+        let c1 = corners[i];
+        let c2 = corners[(i+1) % corners.len()];
+        println!("from {:?} to {:?}", c1, c2);
+        ctx.canvas.set_draw_color(color);
+        ctx.canvas.draw_fline(
+            c1,
+            c2
+        );
+    }
+}
+
+fn point_on_screen(p: &Point3<f64>, ctx: &DrawContext) -> FPoint {
+    FPoint::new(
+        (p.x + ctx.eye.x + ctx.screen_center.x) as f32,
+        (p.y + ctx.eye.y + ctx.screen_center.y) as f32
+    )
+}
+
+fn project_point(p: &Point3<f64>, ctx: &DrawContext) -> FPoint {
+    println!("{:?}",ctx);
+    point_on_screen(&ctx.projection.project_point(p), ctx)
 }
 
 impl Entity for Planet {
@@ -105,16 +176,16 @@ impl Entity for Planet {
     fn get_pos(&self) -> &FPoint3 {
         &self.pos
     }
-    fn vel(&mut self) -> &mut FPoint3 {
+    fn vel(&mut self) -> &mut FVector3 {
         &mut self.vel
     }
-    fn get_vel(&self) -> &FPoint3 {
+    fn get_vel(&self) -> &FVector3 {
         &self.vel
     }
-    fn acc(&mut self) -> &mut FPoint3 {
+    fn acc(&mut self) -> &mut FVector3 {
         &mut self.acc
     }
-    fn get_acc(&self) -> &FPoint3 {
+    fn get_acc(&self) -> &FVector3 {
         &self.acc
     }
     fn col(&mut self) -> &mut Color {
@@ -123,22 +194,12 @@ impl Entity for Planet {
     fn get_col(&self) -> &Color {
         &self.color
     }
-    fn draw(&self, c: &mut Canvas<Window>, ctx: &DrawContext) {
-        c.set_draw_color(self.color);
+    fn draw(&self, ctx: &mut DrawContext) {
+        ctx.canvas.set_draw_color(self.color);
         // draw 3d coordinates object on 2d screen
-
-        let pitch = ((self.pos.x - ctx.camera_pos.x) / (self.pos.y - ctx.camera_pos.y)).atan();
-        let yaw = ((self.pos.z - ctx.camera_pos.z) / (self.pos.y - ctx.camera_pos.y)).atan();
         
-        let pos2d = FPoint::new(
-            ctx.screen_center.x + (pitch * (ctx.screen_center.x * 2.0 / ctx.fov)),
-            ctx.screen_center.y + (yaw * (ctx.screen_center.y * 2.0 / ctx.fov))
-        );
-
-        let size = self.rad * self.pos.z / 100.0;
-        
-
-        draw_circle(&pos2d, &size, &self.color, c);
+        draw_circle(&self.pos, self.rad, &self.color, ctx);
+        //draw_cube(cube_corners(&self.pos, self.rad), &self.color, ctx);
     }
     fn register_behavior(&mut self, b: EntityBehavior){
         self.behaviors.push(b);
@@ -170,24 +231,17 @@ fn behavior_movement(id: usize, entites: &Entities, entities_diff: &mut Entities
         diff = (*(entites.get(&id).unwrap().clone())).clone().clone();
     }
 
-    diff.vel().x += diff.acc().x;
-    diff.vel().y += diff.acc().y;
-    diff.vel().z += diff.acc().z;
+    let a = *diff.acc();
+    *diff.vel() += a;
 
-    diff.pos().x += diff.vel().x;
-    diff.pos().y += diff.vel().y;
-    diff.pos().z += diff.vel().z;
+    let v = *diff.vel();
+    *diff.pos() += v;
 
-    diff.vel().x *= 0.99;
-    diff.vel().y *= 0.99;
-    diff.vel().z *= 0.99;
-    diff.acc().x *= 0.99;
-    diff.acc().y *= 0.99;
-    diff.acc().z *= 0.99;
-
-
+    *diff.acc() = diff.acc().scale(0.99);
+    *diff.vel() = diff.vel().scale(0.99);
     
-    entities_diff.insert(id, diff);   
+    println!("p: {:?}", diff.pos());
+    entities_diff.insert(id, diff); 
 }
 
 fn behavior_gravity(id: usize, entites: &Entities, entities_diff: &mut EntitiesMut) {
@@ -244,49 +298,50 @@ fn tick(w: &mut Entities) {
 pub fn main() -> Result<(), String> {
     let sdl_context = sdl2::init()?;
     let video_subsystem = sdl_context.video();
-    let mut draw_context = DrawContext {
-        screen_center: FPoint3{x: 400.0, y: 320.0, z: 0.0},
-        camera_pos: FPoint3{x: 0.0, y: 0.0, z: 0.0},
-        fov: 10.0,
-    };
-
+    let screen_center = FPoint2::new(400.0, 320.0);
     let window = video_subsystem?
-        .window("rust sdl2 demo: Video", draw_context.screen_center.x as u32 * 2, draw_context.screen_center.y as u32 * 2)
-        .position_centered()
-        .opengl()
-        .build()
-        .map_err(|e| e.to_string()
+    .window("rust sdl2 demo: Video", screen_center.x as u32 * 2, screen_center.y as u32 * 2)
+    .position_centered()
+    .opengl()
+    .build()
+    .map_err(|e| e.to_string()
     )?;
 
     let mut canvas = window
-        .into_canvas()
-        .build()
-        .map_err(|e| e.to_string()
+    .into_canvas()
+    .build()
+    .map_err(|e| e.to_string()
     )?;
 
+    let mut draw_context = DrawContext::new(
+        FPoint2::new(screen_center.x, screen_center.y),
+        FPoint3::new(0.0, 0.0, 0.0),
+        45.0,
+        canvas
+    );
 
     let bg_color = Color::RGB(222, 195, 199);
-    canvas.set_draw_color(bg_color);
-    canvas.clear();
-    canvas.present();
+    draw_context.canvas.set_draw_color(bg_color);
+    draw_context.canvas.clear();
+    draw_context.canvas.present();
 
-    let fps = 1000.0;
+    let fps = 30.0;
     let mut event_loop = sdl_context.event_pump()?;
-    let center = FPoint3{x: 400.0, y: 320.0, z: 100.0};
+    let center = FPoint3::new(400.0, 320.0, 100.0);
 
     let mut entities: Entities = HashMap::new();
     let mut entity_counter: usize = 0;
 
     let simulation_start = std::time::Instant::now();
 
-    for i in 0..10 {
+    for i in 0..1 {
         let mut planet = Planet{
-            pos: random_point_around(&FPoint3{x:0.0, y:0.0, z:90.0}, 10.0),
-            vel: random_point_around(&FPoint3{x:0.0, y:0.0, z:0.0}, 50.0),
-            acc: FPoint3{x:0.0, y:0.0, z:0.0},
+            pos: random_point_around(&FPoint3::new(0.0, 0.0, 0.0), 100.0),
+            vel: random_point_around(&FPoint3::new(0.0, 0.0, 0.0), 10000.0).coords,
+            acc: FVector3::new(0.0, 0.0, 0.0),
             color: random_color(),
             behaviors: vec![behavior_movement],
-            rad: random(1.0, 2.0)
+            rad: random(1.0, 10.0)
         };
         entities.insert(entity_counter, Rc::new(planet));
         entity_counter += 1;
@@ -322,15 +377,15 @@ pub fn main() -> Result<(), String> {
             Ordering::Equal
         });
 
-        canvas.set_draw_color(bg_color);
-        canvas.clear();
+        draw_context.canvas.set_draw_color(bg_color);
+        draw_context.canvas.clear();
 
         for e in &entities
         {
-            e.1.draw(&mut canvas, &draw_context);
+            e.1.draw(&mut draw_context);
         }
 
-        canvas.present();
+        draw_context.canvas.present();
 
         if tick_times.len() > 100 {
             tick_times.remove(0);
@@ -344,12 +399,12 @@ pub fn main() -> Result<(), String> {
         tick_lengths.push(tick_time_end - tick_time_start);
 
 
-        println!("tick time: {:?}, calculated fps: {:?}, real fps: {:?}, target fps: {:?}", 
-            tick_lengths.iter().sum::<Duration>() / tick_lengths.len() as u32,
-            1e9 * tick_lengths.len() as f32 / tick_lengths.iter().sum::<Duration>().as_nanos() as f32,
-            1e9 * tick_times.len() as f32 / (*tick_times.iter().last().unwrap() - *tick_times.iter().nth(0).unwrap()).as_nanos() as f32,
-            fps
-        );
+        // println!("tick time: {:?}, calculated fps: {:?}, real fps: {:?}, target fps: {:?}", 
+        //     tick_lengths.iter().sum::<Duration>() / tick_lengths.len() as u32,
+        //     1e9 * tick_lengths.len() as f32 / tick_lengths.iter().sum::<Duration>().as_nanos() as f32,
+        //     1e9 * tick_times.len() as f32 / (*tick_times.iter().last().unwrap() - *tick_times.iter().nth(0).unwrap()).as_nanos() as f32,
+        //     fps
+        // );
         
         let sleep_duration = Duration::checked_sub(
             Duration::new(0, (1e9/fps) as u32),
