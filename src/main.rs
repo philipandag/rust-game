@@ -4,6 +4,7 @@ use sdl2::pixels::Color;
 use sdl2::rect::{FRect, FPoint};
 use sdl2::render::{Canvas};
 use sdl2::video::Window;
+use core::{f32, f64};
 use std::borrow::BorrowMut;
 use std::cmp::Ordering;
 use std::hash::Hash;
@@ -14,7 +15,7 @@ use std::rc::Rc;
 use std::cell::{Ref, RefCell};
 use std::cell::RefMut;
 use std::collections::HashMap;
-use nalgebra::{Isometry3, Matrix4, Perspective3, Vector2, Vector3, Vector4, Point3, Point2};
+use nalgebra::{Isometry3, Matrix4, Perspective3, Vector2, Vector3, Vector4, Point3, Point2, Rotation3};
 use std::fmt;
 
 type EntityBehavior = fn(entity_id: usize, entites: &Entities, entities_diff: &mut EntitiesMut);
@@ -35,19 +36,6 @@ struct DrawContext {
     projection: Perspective3<f64>,
     canvas: Canvas<Window>
 }
-
-impl fmt::Debug for DrawContext {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DrawContext")
-            .field("screen_center", &self.screen_center)
-            .field("eye", &self.eye)
-            .field("target", &self.target)
-            .field("view", &self.view)
-            .field("projection", &self.projection)
-            .finish()
-    }
-}
-
 impl DrawContext {
     fn new(screen_center: FPoint2, camera_pos: FPoint3, fov: f64, canvas: Canvas<Window>) -> DrawContext {
         let target = camera_pos + Vector3::new(0.0_f64, 0.0_f64, 1.0_f64);
@@ -62,6 +50,17 @@ impl DrawContext {
         }
     }
 }
+impl fmt::Debug for DrawContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DrawContext")
+            .field("screen_center", &self.screen_center)
+            .field("eye", &self.eye)
+            .field("target", &self.target)
+            .field("view", &self.view)
+            .field("projection", &self.projection)
+            .finish()
+    }
+}
 
 trait Entity {
     fn pos(&mut self) -> &mut FPoint3;
@@ -72,6 +71,10 @@ trait Entity {
     fn get_acc(&self) -> &FVector3;
     fn col(&mut self) -> &mut Color;
     fn get_col(&self) -> &Color;
+    fn rot(&mut self) -> &mut FVector3;
+    fn get_rot(&self) -> &FVector3;
+    fn rot_vel(&mut self) -> &mut FVector3;
+    fn get_rot_vel(&self) -> &FVector3;
     fn draw(&self, ctx: &mut DrawContext);
     fn register_behavior(self: &mut Self, b: EntityBehavior);
     fn remove_behavior(self: &mut Self, b: EntityBehavior);
@@ -83,6 +86,9 @@ struct Planet {
     pos: FPoint3,
     vel: FVector3,
     acc: FVector3,
+    rot: FVector3,
+    isom: Isometry3<f64>,
+    rot_vel: FVector3,
     color: Color,
     behaviors: Vec<EntityBehavior>,
     rad: f64,
@@ -110,63 +116,143 @@ fn random_color() -> Color {
     )
 }
 
-fn draw_circle(center: &FPoint3, radius: f64, color: &Color, ctx: &mut DrawContext) {
+fn draw_circle(center: &FPoint, radius: f64, rotation: &FVector3, color: &Color, ctx: &mut DrawContext) {
     let mut color = Color::RGB(color.r, color.g, color.b);
-    let center = project_point(center, ctx);
-    for i in -radius as i32..radius as i32 +5{
-        color = Color::RGB(
-            ((color.r as f32) *0.995) as u8, 
-            ((color.g as f32) *0.995) as u8, 
-            ((color.b as f32) *0.995) as u8, 
+    let mut rx = rotation.y;
+    for i in -radius as i32-5..radius as i32+5{
+        let r = (rx.cos()+0.5).min(1.0).max(0.0);
+        let c = Color::RGB(
+            ((color.r as f64) *r) as u8, 
+            ((color.g as f64) *r) as u8, 
+            ((color.b as f64) *r) as u8, 
         );
-        ctx.canvas.set_draw_color(color);
+        ctx.canvas.set_draw_color(c);
         let y = circle_height(i as f64, 1.0, 1.0, radius);
         ctx.canvas.draw_fline(
             center.offset(i as f32, -y as f32), 
             center.offset(i as f32, y as f32)
         );
+        //rx += f64::consts::PI  / (radius*8.0);
     }
 }
 
-fn cube_corners(center: &FPoint3, size: f64) -> Vec<FPoint3> {
-    let size = size * 1.5;
+fn square_corners(center: &FPoint3, rotation: &FVector3, size: f64) -> Vec<FPoint3> {
     let mut corners = Vec::new();
+    let rotation = Rotation3::from_euler_angles(rotation.x, rotation.y, rotation.z).to_homogeneous();
+    
     for x in [-1.0, 1.0].iter() {
         for y in [-1.0, 1.0].iter() {
-            for z in [-1.0, 1.0].iter() {
-                corners.push(center + FVector3::new(size * x, size * y, size * z));
-            }
+            let mut corner = Vector4::new(*x*size/2.0, *y*size/2.0, 0.0, 1.0);
+            corner = rotation * corner;
+            corners.push(FPoint3::new(
+                center.x + corner.x,
+                center.y + corner.y,
+                center.z + corner.z
+            ));
         }
     }
-    corners
+    vec![corners[0], corners[1], corners[3], corners[2]]
 }
 
-fn draw_cube(corners: Vec<FPoint3>, color: &Color, ctx: &mut DrawContext) {
+fn cube_faces(center: &FPoint3, rotation: &FVector3, size: f64) -> Vec<Vec<FPoint3>>{
+    let mut faces = Vec::new();
+    
+    faces.insert(0, vec![
+        FPoint3::new(-1.0, -1.0, 1.0),
+        FPoint3::new(1.0, -1.0, 1.0),
+        FPoint3::new(1.0, 1.0, 1.0),
+        FPoint3::new(-1.0, 1.0, 1.0),
+    ]);
+    faces.insert(1, vec![
+        FPoint3::new(-1.0, -1.0, -1.0),
+        FPoint3::new(1.0, -1.0, -1.0),
+        FPoint3::new(1.0, 1.0, -1.0),
+        FPoint3::new(-1.0, 1.0, -1.0),
+    ]);
+    faces.insert(2,vec![
+        FPoint3::new(-1.0, 1.0, -1.0),
+        FPoint3::new(-1.0, 1.0, 1.0),
+        FPoint3::new(1.0, 1.0, 1.0),
+        FPoint3::new(1.0, 1.0, -1.0)
+    ]);
+    faces.insert(3,vec![
+        FPoint3::new(-1.0, -1.0, -1.0),
+        FPoint3::new(-1.0, -1.0, 1.0),
+        FPoint3::new(1.0, -1.0, 1.0),
+        FPoint3::new(1.0, -1.0, -1.0)
+    ]);
+    // faces.insert(4,vec![
+    //     FPoint3::new(1.0, -1.0, -1.0),
+    //     FPoint3::new(1.0, -1.0, 1.0),
+    //     FPoint3::new(1.0, 1.0, 1.0),
+    //     FPoint3::new(1.0, 1.0, -1.0)
+    // ]);
+    // faces.insert(5,vec![
+    //     FPoint3::new(-1.0, -1.0, -1.0),
+    //     FPoint3::new(-1.0, -1.0, 1.0),
+    //     FPoint3::new(-1.0, 1.0, 1.0),
+    //     FPoint3::new(-1.0, 1.0, -1.0)
+    // ]);
+
+    for f in &mut faces {
+        for p in f {
+            *p = Isometry3::new(center.coords, *rotation) * *p;
+        }
+    }
+
+    for f in &mut faces {
+        for p in f {
+           // *p = (*p * size) + center.coords;
+        }
+    }
+
+    faces
+}
+
+fn draw_polygon(corners: &Vec<FPoint3>, size: f64, rotation: &FVector3, color: &Color, ctx: &mut DrawContext) {
+    let corners = corners.iter().map(|p| point_on_screen(p, ctx)).collect::<Vec<FPoint3>>();
     let mut color = Color::RGB(color.r, color.g, color.b);
-    let corners = corners.iter().map(|c| project_point(c, ctx)).collect::<Vec<FPoint>>();
-    print!("corners: {:?}", corners);
+    println!("{:?}",corners.len());
+    //println!("{:?}", corners);
     for i in 0..corners.len() {
-        let c1 = corners[i];
-        let c2 = corners[(i+1) % corners.len()];
-        println!("from {:?} to {:?}", c1, c2);
+        let a = corners[i % corners.len()];
+        let b = corners[(i+1) % corners.len()];
+
+        if !sdl_on_screen(&a, ctx) && !sdl_on_screen(&b, ctx) {
+            continue;
+        }
+
+        let a = sdl_point(&a);
+        let b = sdl_point(&b);
+
         ctx.canvas.set_draw_color(color);
-        ctx.canvas.draw_fline(
-            c1,
-            c2
-        );
+        ctx.canvas.draw_fline(a, b);
+        draw_circle(&a, 1.0, rotation, &color, ctx);
+        println!("draw from {a:?} to {b:?}");
     }
 }
 
-fn point_on_screen(p: &Point3<f64>, ctx: &DrawContext) -> FPoint {
-    FPoint::new(
-        (p.x + ctx.eye.x + ctx.screen_center.x) as f32,
-        (p.y + ctx.eye.y + ctx.screen_center.y) as f32
+fn point_on_screen(p: &Point3<f64>, ctx: &DrawContext) -> FPoint3 {
+    FPoint3::new(
+        (p.x + ctx.eye.x + ctx.screen_center.x) as f64,
+        (p.y + ctx.eye.y + ctx.screen_center.y) as f64,
+        0.0
     )
 }
 
-fn project_point(p: &Point3<f64>, ctx: &DrawContext) -> FPoint {
-    println!("{:?}",ctx);
-    point_on_screen(&ctx.projection.project_point(p), ctx)
+fn sdl_point(p: &FPoint3) -> FPoint {
+    FPoint::new(
+        (p.x) as f32,
+        (p.y) as f32
+    )
+}
+
+fn sdl_on_screen(p: &FPoint3, ctx: &DrawContext) -> bool {
+    p.z >= 0.0 && (p.x > 0.0 && p.x < ctx.screen_center.x * 2.0 && p.y > 0.0 && p.y < ctx.screen_center.y * 2.0)
+}
+
+fn project_point(p: &Point3<f64>, ctx: &DrawContext) -> Point3<f64> { 
+    ctx.projection.project_point(p)
 }
 
 impl Entity for Planet {
@@ -188,6 +274,18 @@ impl Entity for Planet {
     fn get_acc(&self) -> &FVector3 {
         &self.acc
     }
+    fn rot(&mut self) -> &mut FVector3 {
+        &mut self.rot
+    }
+    fn get_rot(&self) -> &FVector3 {
+        &self.rot
+    }
+    fn rot_vel(&mut self) -> &mut FVector3 {
+        &mut self.rot_vel
+    }
+    fn get_rot_vel(&self) -> &FVector3 {
+        &self.rot_vel
+    }
     fn col(&mut self) -> &mut Color {
         &mut self.color
     }
@@ -195,11 +293,21 @@ impl Entity for Planet {
         &self.color
     }
     fn draw(&self, ctx: &mut DrawContext) {
+        if self.pos.z < 0.0 {
+            return;
+        }
         ctx.canvas.set_draw_color(self.color);
         // draw 3d coordinates object on 2d screen
+
+        //let size = self.rad * self.pos.z / 100.0;
+        //let corners = square_corners(&self.pos, &self.rot, self.rad)
+        let faces = cube_faces(&self.pos, &self.rot, self.rad);
+        for face in faces {
+            let corners = face.iter().map(|p| project_point(p, ctx)).collect::<Vec<FPoint3>>();
+            draw_polygon(&corners, self.rad, &self.rot, &self.color, ctx);
+        }
         
-        draw_circle(&self.pos, self.rad, &self.color, ctx);
-        //draw_cube(cube_corners(&self.pos, self.rad), &self.color, ctx);
+        
     }
     fn register_behavior(&mut self, b: EntityBehavior){
         self.behaviors.push(b);
@@ -215,9 +323,12 @@ impl Entity for Planet {
             pos: self.pos.clone(),
             vel: self.vel.clone(),
             acc: self.acc.clone(),
+            rot: self.rot.clone(),
+            rot_vel: self.rot_vel.clone(),
             color: self.color.clone(),
             behaviors: self.behaviors.clone(),
-            rad: self.rad
+            rad: self.rad,
+            isom: self.isom.clone()
         })
     }
 }
@@ -237,11 +348,15 @@ fn behavior_movement(id: usize, entites: &Entities, entities_diff: &mut Entities
     let v = *diff.vel();
     *diff.pos() += v;
 
-    *diff.acc() = diff.acc().scale(0.99);
-    *diff.vel() = diff.vel().scale(0.99);
+    let r = *diff.rot_vel();
+    *diff.rot() += r;
+
+
+
+    diff.vel().scale(0.99);
+    diff.acc().scale(0.99);
     
-    println!("p: {:?}", diff.pos());
-    entities_diff.insert(id, diff); 
+    entities_diff.insert(id, diff);   
 }
 
 fn behavior_gravity(id: usize, entites: &Entities, entities_diff: &mut EntitiesMut) {
@@ -299,6 +414,7 @@ pub fn main() -> Result<(), String> {
     let sdl_context = sdl2::init()?;
     let video_subsystem = sdl_context.video();
     let screen_center = FPoint2::new(400.0, 320.0);
+
     let window = video_subsystem?
     .window("rust sdl2 demo: Video", screen_center.x as u32 * 2, screen_center.y as u32 * 2)
     .position_centered()
@@ -313,17 +429,16 @@ pub fn main() -> Result<(), String> {
     .map_err(|e| e.to_string()
     )?;
 
-    let mut draw_context = DrawContext::new(
-        FPoint2::new(screen_center.x, screen_center.y),
+    let mut draw_ctx = DrawContext::new(
+        screen_center,
         FPoint3::new(0.0, 0.0, 0.0),
-        45.0,
+        0.5,
         canvas
     );
 
-    let bg_color = Color::RGB(222, 195, 199);
-    draw_context.canvas.set_draw_color(bg_color);
-    draw_context.canvas.clear();
-    draw_context.canvas.present();
+    let bg_color = Color::RGB(0, 25, 36);
+    draw_ctx.canvas.set_draw_color(bg_color);
+    draw_ctx.canvas.clear();
 
     let fps = 30.0;
     let mut event_loop = sdl_context.event_pump()?;
@@ -334,14 +449,19 @@ pub fn main() -> Result<(), String> {
 
     let simulation_start = std::time::Instant::now();
 
-    for i in 0..1 {
+    for i in 0..100 {
+        let rot = random_point_around(&FPoint3::new(0.0, 0.0, 0.0), 1.0).coords;
+        let pos =  random_point_around(&FPoint3::new(0.0, 0.0, 10.0), 0.0);
         let mut planet = Planet{
-            pos: random_point_around(&FPoint3::new(0.0, 0.0, 0.0), 100.0),
-            vel: random_point_around(&FPoint3::new(0.0, 0.0, 0.0), 10000.0).coords,
+            pos,
+            vel: random_point_around(&FPoint3::new(0.0, 0.0, 0.0), 0.1).coords,
             acc: FVector3::new(0.0, 0.0, 0.0),
+            rot,
+            rot_vel: random_point_around(&FPoint3::new(0.0, 0.1, 0.0), 0.0).coords,
             color: random_color(),
             behaviors: vec![behavior_movement],
-            rad: random(1.0, 10.0)
+            rad: random(1.0, 10.0),
+            isom: Isometry3::new(pos.coords, rot)
         };
         entities.insert(entity_counter, Rc::new(planet));
         entity_counter += 1;
@@ -377,15 +497,15 @@ pub fn main() -> Result<(), String> {
             Ordering::Equal
         });
 
-        draw_context.canvas.set_draw_color(bg_color);
-        draw_context.canvas.clear();
+        draw_ctx.canvas.set_draw_color(bg_color);
+        draw_ctx.canvas.clear();
 
         for e in &entities
         {
-            e.1.draw(&mut draw_context);
+            e.1.draw(&mut draw_ctx);
         }
 
-        draw_context.canvas.present();
+        draw_ctx.canvas.present();
 
         if tick_times.len() > 100 {
             tick_times.remove(0);
